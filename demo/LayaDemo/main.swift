@@ -15,7 +15,7 @@ enum Verdict: Equatable {
     }
 }
 
-/// Jev's two answers about one tool call: keep the call, keep its full result.
+/// Laya's two answers about one tool call: keep the call, keep its full result.
 struct CallScore: Equatable {
     let call: Double
     let result: Double
@@ -201,12 +201,12 @@ final class Demo: ObservableObject {
             }
 
             phase = .waiting
-            status = "Context window at \(Int(context * 100))% — running fast-jev-compaction"
+            status = "Context window at \(Int(context * 100))% — running fast-laya-compaction"
             try await sleep(1.6)
 
             phase = .scanning
             let candidates = candidateCalls.count
-            status = "✻ Asking jev-latest \(candidates * 2) questions (\(candidates) tool calls × keep call? + keep result?) · state = whole history, tool outputs omitted · 1 request"
+            status = "✻ Asking laya-english \(candidates * 2) questions (\(candidates) tool calls × keep call? + keep result?) · state = focused per call · \(candidates) requests"
             try await sleep(0.9)
 
             for chunk in transcript {
@@ -471,8 +471,8 @@ struct TerminalView: View {
             Text("  cwd: ~/work/checkout-service").foregroundStyle(Palette.dim)
             HStack(spacing: 0) {
                 Text("  compaction: ").foregroundStyle(Palette.dim)
-                Text("fast-jev-compaction").foregroundStyle(Palette.cyan)
-                Text(" · jev-latest · verbatim, no summaries").foregroundStyle(Palette.dim)
+                Text("fast-laya-compaction").foregroundStyle(Palette.cyan)
+                Text(" · laya-english · verbatim, no summaries").foregroundStyle(Palette.dim)
             }
         }
         .font(mono)
@@ -581,7 +581,7 @@ struct RootView: View {
 }
 
 @main
-struct JevDemoApp: App {
+struct LayaDemoApp: App {
     var body: some Scene {
         WindowGroup {
             RootView()

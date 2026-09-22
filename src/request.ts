@@ -1,54 +1,73 @@
-import type { JevAnswer, JevQuestions, JevResponse, JevState } from './types.js';
+import type { LayaAnswer, LayaQuestions, LayaResponse, LayaState } from './types.js';
 
-export const SYSTEM_ONE_URL = 'https://api.typesafe.ai/v1/systemone';
-export const DEFAULT_MODEL = 'jev-latest';
+/** Where `laya-server` listens by default. */
+export const SYSTEM_ONE_URL = 'http://127.0.0.1:8765/v1/systemone';
+export const DEFAULT_MODEL = 'laya-english';
 
-export interface JevRequest {
+/**
+ * Approximate state room per question for each Laya model: every question is
+ * evaluated in its own window, state and question together, and anything over
+ * is cut. The router `laya` may pick the 512-token English model.
+ */
+export const MODEL_STATE_TOKENS: Readonly<Record<string, number>> = {
+  'laya-english': 320,
+  'laya-multilingual': 768,
+  'laya-typed-decisions': 768,
+  laya: 320,
+};
+
+/** State budget for an unknown model: the smallest window. */
+export const DEFAULT_STATE_TOKENS = 320;
+
+export function stateTokensFor(model: string | undefined): number {
+  return MODEL_STATE_TOKENS[model ?? DEFAULT_MODEL] ?? DEFAULT_STATE_TOKENS;
+}
+
+export interface LayaRequest {
   url: string;
   method: 'POST';
   headers: Record<string, string>;
   body: string;
 }
 
-/** The HTTP request for one Jev call, for any fetch-like transport. */
-export function buildJevRequest(
+/** The HTTP request for one Laya call, for any fetch-like transport. */
+export function buildLayaRequest(
   params: {
-    apiKey: string;
+    apiKey?: string;
     model?: string;
     baseUrl?: string;
   },
-  state: JevState,
-  questions: JevQuestions,
-): JevRequest {
+  state: LayaState,
+  questions: LayaQuestions,
+): LayaRequest {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (params.apiKey) headers.authorization = `Bearer ${params.apiKey}`;
   return {
-    url: params.baseUrl ?? SYSTEM_ONE_URL,
+    url: params.baseUrl || SYSTEM_ONE_URL,
     method: 'POST',
-    headers: {
-      authorization: `Bearer ${params.apiKey}`,
-      'content-type': 'application/json',
-    },
+    headers,
     body: JSON.stringify({
-      model: params.model ?? DEFAULT_MODEL,
+      model: params.model || DEFAULT_MODEL,
       state,
       questions,
     }),
   };
 }
 
-/** Validates a Jev response body; throws on anything but an `answers` object. */
-export function parseJevResponse(
+/** Validates a Laya response body; throws on anything but an `answers` object. */
+export function parseLayaResponse(
   status: number,
   ok: boolean,
   text: string,
-): JevResponse {
+): LayaResponse {
   if (!ok) {
-    throw new Error(`Jev request failed (${status}): ${text.slice(0, 200)}`);
+    throw new Error(`Laya request failed (${status}): ${text.slice(0, 200)}`);
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new Error('Jev returned malformed JSON');
+    throw new Error('Laya returned malformed JSON');
   }
   if (
     parsed === null ||
@@ -57,14 +76,19 @@ export function parseJevResponse(
     parsed.answers === null ||
     typeof parsed.answers !== 'object'
   ) {
-    throw new Error('Jev response is missing answers');
+    throw new Error('Laya response is missing answers');
   }
-  return parsed as JevResponse;
+  return parsed as LayaResponse;
+}
+
+/** Whether the server reported cutting this request to fit the model's window. */
+export function wasTruncated(response: LayaResponse): boolean {
+  return response.truncation !== undefined && response.truncation !== null;
 }
 
 /** The `noul` probability of one answer; throws when it is not there. */
 export function noulAnswer(
-  answers: Record<string, JevAnswer>,
+  answers: Record<string, LayaAnswer>,
   name: string,
 ): number {
   const answer = answers[name];
@@ -74,7 +98,7 @@ export function noulAnswer(
     typeof answer.noul !== 'number' ||
     !Number.isFinite(answer.noul)
   ) {
-    throw new Error(`Invalid Jev answer for ${name}`);
+    throw new Error(`Invalid Laya answer for ${name}`);
   }
   return answer.noul;
 }

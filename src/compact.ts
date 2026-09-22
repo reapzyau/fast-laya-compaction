@@ -1,13 +1,12 @@
-import { noulAnswer } from './request.js';
-import { collectToolCalls, estimateTokens, fitState } from './state.js';
+import { DEFAULT_MODEL, noulAnswer, stateTokensFor, wasTruncated } from './request.js';
+import { collectToolCalls, focusedState } from './state.js';
 import type {
   CallAnswer,
   CallDecision,
   CompactOptions,
   CompactResult,
-  CompactionState,
-  JevAsker,
-  JevQuestions,
+  LayaAsker,
+  LayaQuestions,
   Message,
   ResolvedCompactOptions,
   ToolCall,
@@ -18,13 +17,10 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   goal: '',
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
-  maxStateTokens: 25_000,
-  maxRequestTokens: 30_000,
+  maxStateTokens: stateTokensFor(DEFAULT_MODEL),
   truncateHeadChars: 300,
+  concurrency: 8,
 };
-
-/** Tokens the request envelope (`model`, key names) adds around state and questions. */
-const REQUEST_OVERHEAD_TOKENS = 20;
 
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -40,62 +36,59 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
         finite(options.preserveRecentMessages, DEFAULT_OPTIONS.preserveRecentMessages),
       ),
     ),
-    maxStateTokens: Math.max(1, finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
-    maxRequestTokens: Math.max(
+    maxStateTokens: Math.max(
       1,
-      finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens),
+      Math.floor(finite(options.maxStateTokens, stateTokensFor(options.model))),
     ),
     truncateHeadChars: Math.max(
       0,
       Math.floor(finite(options.truncateHeadChars, DEFAULT_OPTIONS.truncateHeadChars)),
     ),
-  };
-}
-
-/** The two `noul` questions asked about one call: keep the call, keep its result. */
-export function questionsFor(call: ToolCall): JevQuestions {
-  return {
-    [`call_${call.id}`]: {
-      type: 'noul',
-      instructions: `Tool call ${call.id} (${call.tool}) should stay in the history: knowing this call was made, with its input, still matters for what the assistant does next`,
-    },
-    [`result_${call.id}`]: {
-      type: 'noul',
-      instructions: `The full output of tool call ${call.id} (${call.tool}, ${call.resultChars} chars) should stay in the history verbatim: the assistant still needs its contents and re-running the tool would not do`,
-    },
+    concurrency: Math.max(
+      1,
+      Math.floor(finite(options.concurrency, DEFAULT_OPTIONS.concurrency)),
+    ),
   };
 }
 
 /**
- * Splits the candidate calls into batches whose questions, together with the
- * (always complete) state, fit one request.
+ * The two `noul` questions asked about one call: keep the call, keep its
+ * result. Short, because each question shares Laya's small window with the state.
  */
-export function batchCalls(
-  calls: readonly ToolCall[],
-  stateTokens: number,
-  options: Pick<ResolvedCompactOptions, 'maxRequestTokens'>,
-): ToolCall[][] {
-  const budget = options.maxRequestTokens - stateTokens - REQUEST_OVERHEAD_TOKENS;
-  const batches: ToolCall[][] = [];
-  let current: ToolCall[] = [];
-  let currentTokens = 0;
-  for (const call of calls) {
-    const tokens = estimateTokens(JSON.stringify(questionsFor(call)));
-    if (current.length > 0 && currentTokens + tokens > budget) {
-      batches.push(current);
-      current = [];
-      currentTokens = 0;
+export function questionsFor(call: Pick<ToolCall, 'id'>): LayaQuestions {
+  return {
+    [`call_${call.id}`]: {
+      type: 'noul',
+      instructions:
+        'The assistant still needs to remember this tool call and its input for what it does next.',
+    },
+    [`result_${call.id}`]: {
+      type: 'noul',
+      instructions:
+        "The assistant still needs this tool call's full output verbatim; re-running the tool would not do.",
+    },
+  };
+}
+
+/** Maps `items` through `fn` with at most `limit` promises pending at once, in order. */
+export async function mapLimit<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await fn(items[index]!, index);
     }
-    if (current.length === 0 && tokens > budget) {
-      throw new Error(
-        `state leaves no room for questions (~${stateTokens} of ${options.maxRequestTokens} tokens)`,
-      );
-    }
-    current.push(call);
-    currentTokens += tokens;
-  }
-  if (current.length > 0) batches.push(current);
-  return batches;
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(Math.max(1, limit), items.length) }, worker),
+  );
+  return results;
 }
 
 export function decideCall(
@@ -114,28 +107,31 @@ export function decideCall(
   return { ...base, action: 'drop_call', reason: 'call_dropped' };
 }
 
-async function askBatch(
-  asker: JevAsker,
-  state: CompactionState,
-  batch: readonly ToolCall[],
-): Promise<Map<string, CallAnswer>> {
-  const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
-  const { answers } = await asker.ask(state, questions);
-  return new Map(
-    batch.map((call) => [
-      call.id,
-      {
-        keepCall: noulAnswer(answers, `call_${call.id}`),
-        keepResult: noulAnswer(answers, `result_${call.id}`),
-      },
-    ]),
-  );
+type Asked = { answer: CallAnswer; stateTokens: number; truncated: boolean };
+
+async function askCall(
+  asker: LayaAsker,
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  call: ToolCall,
+  options: ResolvedCompactOptions,
+): Promise<Asked> {
+  const { state, tokens } = focusedState(messages, calls, call, options);
+  const response = await asker.ask(state, questionsFor(call));
+  return {
+    answer: {
+      keepCall: noulAnswer(response.answers, `call_${call.id}`),
+      keepResult: noulAnswer(response.answers, `result_${call.id}`),
+    },
+    stateTokens: tokens,
+    truncated: wasTruncated(response),
+  };
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
   if (text.length <= headChars + 120) return text;
   const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
+  return `${head}[fast-laya-compaction truncated ${text.length - headChars} chars of this tool result${
     isError ? ' (error)' : ''
   }; re-run the tool if needed]`;
 }
@@ -248,15 +244,16 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
 }
 
 /**
- * Compacts a transcript by asking Jev, for every tool call outside the pinned
+ * Compacts a transcript by asking Laya, for every tool call outside the pinned
  * first and newest messages, whether the call and whether its result must
- * stay. The whole history (results omitted, fitted into `maxStateTokens`) is
- * sent as state with every batch of questions. Throws when Jev fails or the
- * history cannot be fitted; the caller decides whether to fall back.
+ * stay. Each call gets its own request with a focused state (goal, the call,
+ * the head of its result, what happened after it) fitted into
+ * `maxStateTokens`; requests run `concurrency` at a time. Throws when Laya
+ * fails; the caller decides whether to fall back.
  */
 export async function compact(
   messages: readonly Message[],
-  asker: JevAsker,
+  asker: LayaAsker,
   options: CompactOptions = {},
 ): Promise<CompactResult> {
   const started = Date.now();
@@ -265,18 +262,10 @@ export async function compact(
   const candidates = calls.filter((call) => !call.pinned);
   const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
-  let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
-  let batches: ToolCall[][] = [];
-  const answers = new Map<string, CallAnswer>();
-  if (candidates.length > 0) {
-    const state = fitState(messages, calls, resolved);
-    fitted = state;
-    batches = batchCalls(candidates, state.tokens, resolved);
-    const answered = await Promise.all(
-      batches.map((batch) => askBatch(asker, state.state, batch)),
-    );
-    for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
-  }
+  const asked = await mapLimit(candidates, resolved.concurrency, (call) =>
+    askCall(asker, messages, calls, call, resolved),
+  );
+  const answers = new Map(candidates.map((call, i) => [call.id, asked[i]!.answer]));
 
   const decisions = calls.map((call) =>
     decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
@@ -300,9 +289,9 @@ export async function compact(
       resultsDropped: count(decisions, 'result_dropped'),
       callsDropped: count(decisions, 'call_dropped'),
       pinned: count(decisions, 'pinned'),
-      stateTokens: fitted.tokens,
-      stateStage: fitted.stage,
-      requests: batches.length,
+      stateTokens: asked.reduce((max, a) => Math.max(max, a.stateTokens), 0),
+      requests: asked.length,
+      truncatedRequests: asked.filter((a) => a.truncated).length,
       ms: Date.now() - started,
     },
   };

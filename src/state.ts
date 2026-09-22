@@ -1,29 +1,26 @@
-import type {
-  CompactionState,
-  FittedState,
-  HistoryEntry,
-  Message,
-  ResolvedCompactOptions,
-  ToolCall,
-  ToolResult,
-} from './types.js';
+import type { FocusedState, Message, ToolCall, ToolResult } from './types.js';
 
-export const STATE_CONTEXT =
-  'A coding assistant conversation is being compacted to free context. `history` is the whole conversation so far, oldest first; tool outputs are replaced by a short `result` note and long texts may be abridged. Each question asks whether one tool call, or the full output of that call, still needs to stay in the history verbatim. Whatever is not kept is deleted permanently, but the assistant can always re-run a tool or re-read a file.';
-
-/** Successive caps on the serialised tool input included per call. */
-const INPUT_CHARS = [1000, 200, 60] as const;
-const TEXT_HEAD = 400;
-const TEXT_TAIL = 150;
+/** Characters of the result shown to Laya, before fitting. */
+const RESULT_HEAD = 200;
+/** Characters of one serialised input value on a call line, before fitting. */
+const INPUT_VALUE_CHARS = 200;
+/** Share of the budget the goal may take. */
+const GOAL_SHARE = 0.25;
+/** Most tokens one later line (message text or call) may take. */
+const LATER_LINE_TOKENS = 48;
+/** Below this many free tokens a later line is not worth starting. */
+const MIN_LINE_TOKENS = 6;
+/** A later line cut shorter than this says too little to keep. */
+const MIN_CUT_TOKENS = 10;
 
 const TOKEN_PIECES = /[A-Za-z]+|\d+|[^\sA-Za-z\d]/g;
 
 /**
  * Estimates tokens without a tokenizer: a word costs one token per six
  * letters, a digit half a token, any other symbol nine tenths. Calibrated
- * against the usage Jev reports for real transcripts, where it lands 2–18%
- * above the true count; a plain characters-per-token ratio undercounts the
- * JSON-heavy states by up to 40%.
+ * upstream against the usage a System One server reports for real
+ * transcripts, where it lands 2–18% above the true count. Whitespace is free,
+ * so lines joined by newlines never cost more than the lines on their own.
  */
 export function estimateTokens(text: string): number {
   let tokens = 0;
@@ -39,12 +36,6 @@ export function estimateTokens(text: string): number {
 
 export function truncate(text: string, limit: number): string {
   return text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 1))}…`;
-}
-
-function abridge(text: string, head: number, tail: number): string {
-  if (text.length <= head + tail + 40) return text;
-  const omitted = text.length - head - tail;
-  return `${text.slice(0, head)}\n[… ${omitted} chars omitted …]\n${text.slice(-tail)}`;
 }
 
 export function isPinned(
@@ -92,84 +83,6 @@ export function collectToolCalls(
   return calls;
 }
 
-function inputText(input: Record<string, unknown>, limit: number): string {
-  let json = '';
-  try {
-    json = JSON.stringify(input);
-  } catch {
-    json = '[unserializable input]';
-  }
-  return truncate(json, limit);
-}
-
-function resultNote(call: ToolCall): string {
-  return `${call.isError ? 'error' : 'ok'}, ${call.resultChars} chars (omitted)`;
-}
-
-/** One call as a single line, for when the structured form is too costly. */
-function compactCall(call: ToolCall): string {
-  const input = Object.entries(call.input)
-    .map(([key, value]) => {
-      const text = typeof value === 'string' ? value : inputText({ [key]: value }, 200);
-      return `${key}=${text.replace(/\s+/g, ' ')}`;
-    })
-    .join(' ');
-  return `${call.id} ${call.tool} ${truncate(input, INPUT_CHARS[2])} → ${
-    call.isError ? 'error' : 'ok'
-  } ${call.resultChars}ch`;
-}
-
-/**
- * Folds runs of adjacent call-only entries into one entry each, so the
- * per-entry envelope is paid once per run; the call lines keep their ids.
- */
-function mergeCallRuns(history: readonly HistoryEntry[], pinned: (e: HistoryEntry) => boolean): HistoryEntry[] {
-  const merged: HistoryEntry[] = [];
-  for (const entry of history) {
-    const previous = merged[merged.length - 1];
-    const foldable = (e: HistoryEntry): boolean =>
-      !pinned(e) && e.text.length === 0 && typeof e.tool_calls?.[0] === 'string';
-    if (previous && foldable(previous) && foldable(entry) && previous.role === entry.role) {
-      previous.tool_calls = [...(previous.tool_calls as string[]), ...(entry.tool_calls as string[])];
-      continue;
-    }
-    merged.push({ ...entry });
-  }
-  return merged;
-}
-
-function callsByMessage(calls: readonly ToolCall[]): Map<number, ToolCall[]> {
-  const byMessage = new Map<number, ToolCall[]>();
-  for (const call of calls) {
-    const list = byMessage.get(call.callIndex) ?? [];
-    list.push(call);
-    byMessage.set(call.callIndex, list);
-  }
-  return byMessage;
-}
-
-function historyEntries(
-  messages: readonly Message[],
-  calls: readonly ToolCall[],
-  inputChars: number,
-): HistoryEntry[] {
-  const byMessage = callsByMessage(calls);
-  const entries: HistoryEntry[] = [];
-  messages.forEach((message, i) => {
-    const toolCalls = (byMessage.get(i) ?? []).map((call) => ({
-      id: call.id,
-      tool: call.tool,
-      input: inputText(call.input, inputChars),
-      result: resultNote(call),
-    }));
-    if (message.text.trim().length === 0 && toolCalls.length === 0) return;
-    const entry: HistoryEntry = { i, role: message.role, text: message.text };
-    if (toolCalls.length > 0) entry.tool_calls = toolCalls;
-    entries.push(entry);
-  });
-  return entries;
-}
-
 /** The last three user prompts, as the default `goal`. */
 export function goalFromMessages(messages: readonly Message[]): string {
   return messages
@@ -184,121 +97,160 @@ export function goalFromMessages(messages: readonly Message[]): string {
     .join('\n');
 }
 
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function valueText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return '[unserializable]';
+  }
+}
+
+/** A call as one line: `t3: Read file_path=src/a.ts → ok, 1000 chars`. */
+export function callLine(call: ToolCall): string {
+  const input = Object.entries(call.input)
+    .map(([key, value]) => `${key}=${truncate(oneLine(valueText(value)), INPUT_VALUE_CHARS)}`)
+    .join(' ');
+  return `${call.id}: ${call.tool}${input ? ` ${input}` : ''} → ${
+    call.isError ? 'error' : 'ok'
+  }, ${call.resultChars} chars`;
+}
+
 /**
- * Builds the Jev state from the whole conversation and shrinks it in stages
- * until it fits `maxStateTokens`: tool inputs are truncated, then long texts
- * are abridged oldest-first (pinned messages last), then old messages collapse
- * to a one-line note, then old tool calls shrink to one line each, then old
- * messages that carry no call are left out, then runs of old call-only
- * messages are folded into one entry. Throws when even that is too big.
+ * The longest cut of `text` (head only, or head and tail) whose line
+ * `prefix + cut` is estimated at `maxTokens` or less; '' when not even the
+ * prefix with a one-character cut fits. Binary search over the kept length;
+ * only candidates that were measured to fit are ever returned.
  */
-export function fitState(
+export function fitLine(
+  prefix: string,
+  text: string,
+  maxTokens: number,
+  keepTail = false,
+): string {
+  const whole = `${prefix}${text}`;
+  if (estimateTokens(whole) <= maxTokens) return whole;
+  const cut = (chars: number): string => {
+    if (!keepTail || chars < 20) return `${prefix}${text.slice(0, chars)}…`;
+    const tail = Math.floor(chars / 3);
+    return `${prefix}${text.slice(0, chars - tail)} … ${text.slice(-tail)}`;
+  };
+  let lo = 0;
+  let hi = text.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (estimateTokens(cut(mid)) <= maxTokens) lo = mid;
+    else hi = mid - 1;
+  }
+  if (lo === 0) return '';
+  const line = cut(lo);
+  return estimateTokens(line) <= maxTokens ? line : '';
+}
+
+function resultText(messages: readonly Message[], call: ToolCall): string {
+  const found = messages[call.resultIndex]?.toolResults?.find(
+    (result: ToolResult) => result.tool_use_id === call.tool_use_id,
+  );
+  return found?.text ?? '';
+}
+
+/**
+ * The input key whose string value a later call repeats (a later read or edit
+ * of the same file, a re-run of the same command), and whether that value is
+ * resource-like (no whitespace: paths, patterns), which ranks it first.
+ */
+function sharedKey(call: ToolCall, other: ToolCall): { key: string; exact: boolean } | undefined {
+  let found: { key: string; exact: boolean } | undefined;
+  for (const [key, value] of Object.entries(call.input)) {
+    if (typeof value !== 'string' || value.length < 3 || value.length > 300) continue;
+    if (!Object.values(other.input).includes(value)) continue;
+    const exact = !/\s/.test(value);
+    if (exact) return { key, exact };
+    found ??= { key, exact };
+  }
+  return found;
+}
+
+/** A later message text, or a later call (whose tail, `→ ok, N chars`, is kept when cut). */
+type LaterEvent = { line: string; isCall: boolean; rank: number; shown: boolean };
+
+/**
+ * The state Laya sees for one call: plain text, in priority order — the goal
+ * (at most a quarter of the budget), the call itself, the head of its result,
+ * then what happened after it: later calls sharing an input value with it
+ * (e.g. the same `file_path`) first, then the newest messages and calls,
+ * newest last. Lines are shortened or dropped so the whole state always fits
+ * `maxStateTokens`.
+ */
+export function focusedState(
   messages: readonly Message[],
   calls: readonly ToolCall[],
-  options: Pick<ResolvedCompactOptions, 'maxStateTokens' | 'preserveRecentMessages' | 'goal'>,
-): FittedState {
-  const goal = options.goal || goalFromMessages(messages);
-  const stateOf = (history: HistoryEntry[]): CompactionState => ({
-    context: STATE_CONTEXT,
-    goal,
-    history,
-  });
-  const entryTokens = (entry: HistoryEntry): number => estimateTokens(JSON.stringify(entry)) + 1;
-  const baseTokens = estimateTokens(JSON.stringify(stateOf([])));
-  const fitted = (history: HistoryEntry[], tokens: number, stage: string): FittedState => ({
-    state: stateOf(history),
-    tokens,
-    stage,
-  });
-
-  let history: HistoryEntry[] = [];
-  let perEntry: number[] = [];
-  let tokens = 0;
-  const rebuild = (inputChars: number): void => {
-    history = historyEntries(messages, calls, inputChars);
-    perEntry = history.map(entryTokens);
-    tokens = baseTokens + perEntry.reduce((sum, n) => sum + n, 0);
-  };
-  const fits = (): boolean => tokens <= options.maxStateTokens;
-  const shrink = (index: number, change: (entry: HistoryEntry) => void): void => {
-    const entry = history[index];
-    if (!entry) return;
-    change(entry);
-    const now = entryTokens(entry);
-    tokens += now - (perEntry[index] ?? 0);
-    perEntry[index] = now;
+  call: ToolCall,
+  options: { maxStateTokens: number; goal?: string },
+): FocusedState {
+  const budget = Math.max(0, Math.floor(options.maxStateTokens));
+  const lines: string[] = [];
+  let used = 0;
+  const add = (line: string): boolean => {
+    if (!line) return false;
+    lines.push(line);
+    used += estimateTokens(line);
+    return true;
   };
 
-  rebuild(INPUT_CHARS[0]);
-  if (fits()) return fitted(history, tokens, 'full');
+  const goal = oneLine(options.goal || goalFromMessages(messages));
+  if (goal) add(fitLine('Goal: ', goal, Math.floor(budget * GOAL_SHARE), true));
+  add(fitLine('This call ', callLine(call), budget - used, true));
+  const head = oneLine(resultText(messages, call).slice(0, RESULT_HEAD * 2)).slice(0, RESULT_HEAD);
+  if (head) add(fitLine('Result starts: ', head, budget - used));
 
-  for (const limit of INPUT_CHARS.slice(1)) {
-    rebuild(limit);
-    if (fits()) return fitted(history, tokens, `inputs<=${limit}`);
-  }
-
-  const pinned = (entry: HistoryEntry): boolean =>
-    isPinned(entry.i, messages.length, options.preserveRecentMessages);
-  const indices = history.map((_, index) => index);
-  const order = [
-    ...indices.filter((index) => !pinned(history[index]!)),
-    ...indices.filter((index) => pinned(history[index]!)),
-  ];
-
-  for (const index of order) {
-    const entry = history[index]!;
-    if (entry.text.length <= TEXT_HEAD + TEXT_TAIL + 40) continue;
-    shrink(index, (e) => {
-      e.text = abridge(e.text, TEXT_HEAD, TEXT_TAIL);
-    });
-    if (fits()) return fitted(history, tokens, 'texts abridged');
-  }
-
-  for (const index of order) {
-    const entry = history[index]!;
-    if (pinned(entry) || entry.text.length === 0) continue;
-    const original = messages[entry.i]?.text.length ?? entry.text.length;
-    shrink(index, (e) => {
-      e.text = `[… ${original} chars omitted …]`;
-    });
-    if (fits()) return fitted(history, tokens, 'old messages collapsed');
-  }
-
-  const byMessage = callsByMessage(calls);
-  for (const index of order) {
-    const entry = history[index]!;
-    const own = byMessage.get(entry.i);
-    if (pinned(entry) || !own) continue;
-    shrink(index, (e) => {
-      e.tool_calls = own.map(compactCall);
-    });
-    if (fits()) return fitted(history, tokens, 'old calls compacted');
-  }
-
-  const left = new Set<number>();
-  for (const index of order) {
-    const entry = history[index]!;
-    if (pinned(entry) || entry.tool_calls) continue;
-    left.add(index);
-    tokens -= perEntry[index] ?? 0;
-    if (fits()) {
-      return fitted(
-        history.filter((_, i) => !left.has(i)),
-        tokens,
-        'old messages left out',
-      );
+  const events: LaterEvent[] = [];
+  const later = calls.filter((other) => other.callIndex > call.callIndex);
+  for (let i = call.callIndex + 1; i < messages.length; i += 1) {
+    const text = oneLine(messages[i]?.text ?? '');
+    if (text) events.push({ line: `${messages[i]!.role}: ${text}`, isCall: false, rank: 0, shown: false });
+    for (const other of later) {
+      if (other.callIndex !== i) continue;
+      const shared = sharedKey(call, other);
+      const line = shared ? `${callLine(other)} [same ${shared.key}]` : callLine(other);
+      events.push({ line, isCall: true, rank: shared ? (shared.exact ? 2 : 1) : 0, shown: false });
     }
   }
+  if (events.length === 0) return { state: lines.join('\n'), tokens: estimateTokens(lines.join('\n')) };
 
-  history = mergeCallRuns(
-    history.filter((_, i) => !left.has(i)),
-    pinned,
-  );
-  perEntry = history.map(entryTokens);
-  tokens = baseTokens + perEntry.reduce((sum, n) => sum + n, 0);
-  if (fits()) return fitted(history, tokens, 'old calls merged');
-
-  throw new Error(
-    `history too large for Jev (~${tokens} tokens after truncation, limit ${options.maxStateTokens})`,
-  );
+  const header = 'Later:';
+  const headerTokens = estimateTokens(header);
+  const laterLines: string[] = [];
+  let room = budget - used - headerTokens;
+  // Same-input calls go first but may take only half the room, so the newest
+  // events still show.
+  let relatedRoom = Math.floor(room / 2);
+  const related = events.filter((event) => event.rank > 0).sort((a, b) => b.rank - a.rank);
+  for (const event of related) {
+    if (relatedRoom < MIN_LINE_TOKENS) break;
+    const line = fitLine('', event.line, Math.min(relatedRoom, LATER_LINE_TOKENS), true);
+    if (!line || (line !== event.line && estimateTokens(line) < MIN_CUT_TOKENS)) break;
+    laterLines.push(line);
+    event.shown = true;
+    const cost = estimateTokens(line);
+    relatedRoom -= cost;
+    room -= cost;
+  }
+  const recent: string[] = [];
+  for (let e = events.length - 1; e >= 0 && room >= MIN_LINE_TOKENS; e -= 1) {
+    const event = events[e]!;
+    if (event.shown) continue;
+    const line = fitLine('', event.line, Math.min(room, LATER_LINE_TOKENS), event.isCall);
+    if (!line || (line !== event.line && estimateTokens(line) < MIN_CUT_TOKENS)) break;
+    recent.push(line);
+    room -= estimateTokens(line);
+  }
+  laterLines.push(...recent.reverse());
+  if (laterLines.length > 0) add([header, ...laterLines].join('\n'));
+  const state = lines.join('\n');
+  return { state, tokens: estimateTokens(state) };
 }

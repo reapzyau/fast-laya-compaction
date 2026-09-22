@@ -3,10 +3,12 @@ import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  register,
   resolveHookConfig,
   summarize,
   toSessionMessages,
-} from '../hooks/fast-jev.ts';
+  withEnv,
+} from '../hooks/fast-laya.ts';
 import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
 
 type SessionMessage = Message & { handle?: string };
@@ -40,9 +42,11 @@ function transcript(): SessionMessage[] {
   ];
 }
 
-function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
-  return async (_url: string, init?: { body?: string }) => {
-    bodies.push(init?.body ?? '');
+type Sent = { url: string; headers: Record<string, string>; body: string };
+
+function layaFetch(answer: (name: string) => number, sent: Sent[] = []) {
+  return async (url: string, init?: { headers?: Record<string, string>; body?: string }) => {
+    sent.push({ url, headers: init?.headers ?? {}, body: init?.body ?? '' });
     const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
     const answers = Object.fromEntries(
       Object.keys(questions).map((key) => [key, { type: 'noul', noul: answer(key) }]),
@@ -53,14 +57,26 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'jev-latest' });
+    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'laya-english' });
     expect(
-      resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
+      resolveHookConfig({
+        baseUrl: 'http://gpu:8765/v1/systemone',
+        apiKey: 'k',
+        keepThreshold: 0.3,
+        maxStateTokens: 700,
+        concurrency: 4,
+        maxRequestTokens: 30_000,
+        model: 'laya-multilingual',
+        goal: 'g',
+        compactAtPercent: 'no',
+      }),
     ).toEqual({
+      baseUrl: 'http://gpu:8765/v1/systemone',
       apiKey: 'k',
       keepThreshold: 0.3,
-      maxStateTokens: 1000,
-      model: 'jev-x',
+      maxStateTokens: 700,
+      concurrency: 4,
+      model: 'laya-multilingual',
       goal: 'g',
       compactAtPercent: 60,
       minReductionRatio: 0.25,
@@ -83,11 +99,11 @@ describe('session message mapping', () => {
     expect(out[0]).toBe(messages[0]);
     expect(out[1]?.handle).toBeUndefined();
     expect(out[1]?.toolUses[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
+      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-laya-compaction truncated 1700 chars`),
     );
     expect(out[2]?.handle).toBeUndefined();
     expect(out[2]?.toolResults?.[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
+      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-laya-compaction truncated 1700 chars`),
     );
     expect(out[2]?.toolResults?.[0]).toMatchObject({ tool_use_id: 'tool-1', isError: false });
     expect(out[3]).toBe(messages[3]);
@@ -111,25 +127,46 @@ describe('session message mapping', () => {
 
 describe('compactSession', () => {
   it('runs the library over the engine fetch and reports the outcome', async () => {
-    const bodies: string[] = [];
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k', model: 'jev-x' };
+    const sent: Sent[] = [];
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), model: 'laya-multilingual' };
     const { result: output, messages } = await compactSession(
       transcript(),
       config,
-      jevFetch((name) => (name === 'call_t2' || name === 'result_t2' ? 0.9 : 0.1), bodies),
+      layaFetch((name) => (name === 'call_t2' || name === 'result_t2' ? 0.9 : 0.1), sent),
     );
-    expect(bodies).toHaveLength(1);
-    expect(JSON.parse(bodies[0]!).model).toBe('jev-x');
+    expect(sent).toHaveLength(2);
+    expect(sent[0]!.url).toBe('http://127.0.0.1:8765/v1/systemone');
+    expect(sent[0]!.headers.authorization).toBeUndefined();
+    expect(JSON.parse(sent[0]!.body).model).toBe('laya-multilingual');
     expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
     expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
-    expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 call_dropped; state ~\d+ tokens \(full\) in 1 request\(s\)$/);
+    expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 call_dropped; 2 request\(s\), state <=~\d+ tokens$/);
     expect(decisionLog(output)).toBe('t1:Read:drop_call/call=0.10/result=0.10 t2:Bash:keep/call=0.90/result=0.90');
     expect(decisionLogLines(output)).toEqual([`decisions: ${decisionLog(output)}`]);
   });
 
+  it('sends the key and base URL when configured and reports truncation', async () => {
+    const sent: Sent[] = [];
+    const config = {
+      ...resolveHookConfig({ preserveRecentMessages: 1 }),
+      apiKey: 'k',
+      baseUrl: 'http://gpu:8765/v1/systemone',
+    };
+    const fetchFn = async (url: string, init?: { headers?: Record<string, string>; body?: string }) => {
+      const response = await layaFetch(() => 0.9, sent)(url, init);
+      const body = JSON.parse(response.text) as Record<string, unknown>;
+      return { ...response, text: JSON.stringify({ ...body, truncation: { state: 40 } }) };
+    };
+    const { result: output } = await compactSession(transcript(), config, fetchFn);
+    expect(sent.every((r) => r.headers.authorization === 'Bearer k')).toBe(true);
+    expect(sent.every((r) => r.url === 'http://gpu:8765/v1/systemone')).toBe(true);
+    expect(output.stats.truncatedRequests).toBe(2);
+    expect(summarize(output)).toMatch(/, 2 truncated by Laya$/);
+  });
+
   it('splits a long decision log into ui.log lines under the host limit', async () => {
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
-    const { result: output } = await compactSession(transcript(), config, jevFetch(() => 0.1));
+    const config = resolveHookConfig({ preserveRecentMessages: 1 });
+    const { result: output } = await compactSession(transcript(), config, layaFetch(() => 0.1));
     const lines = decisionLogLines(output, 60);
     expect(lines).toEqual([
       'decisions (1/2): t1:Read:drop_call/call=0.10/result=0.10',
@@ -139,11 +176,89 @@ describe('compactSession', () => {
     expect(decisionLogLines({ ...output, decisions: [] })).toEqual(['decisions: (none)']);
   });
 
-  it('throws on a missing key and on failed requests so the hook falls back', async () => {
+  it('throws on failed or unreachable requests so the hook falls back', async () => {
     const config = resolveHookConfig({ preserveRecentMessages: 1 });
-    await expect(compactSession(transcript(), config, jevFetch(() => 0))).rejects.toThrow(/TYPESAFE_API_KEY/);
     await expect(
-      compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
+      compactSession(transcript(), config, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
+    await expect(
+      compactSession(transcript(), config, async () => {
+        throw new Error('connect ECONNREFUSED 127.0.0.1:8765');
+      }),
+    ).rejects.toThrow(/ECONNREFUSED/);
+  });
+});
+
+function envSource(env: Record<string, string>, settingsEnv: Record<string, string> = {}) {
+  return {
+    env: { get: async (name: string) => env[name] },
+    settings: { read: async () => ({ env: settingsEnv }) },
+  };
+}
+
+describe('environment fallbacks', () => {
+  it('prefers options, then LAYA_BASE_URL / LAYA_API_KEY, then the settings env, else leaves them unset', async () => {
+    const base = resolveHookConfig({});
+    expect(await withEnv(envSource({}), base)).toEqual(base);
+    expect(
+      await withEnv(envSource({ LAYA_BASE_URL: 'http://env/v1/systemone', LAYA_API_KEY: 'env-key' }), base),
+    ).toMatchObject({ baseUrl: 'http://env/v1/systemone', apiKey: 'env-key' });
+    expect(
+      await withEnv(envSource({}, { LAYA_BASE_URL: 'http://settings/v1/systemone', LAYA_API_KEY: 's-key' }), base),
+    ).toMatchObject({ baseUrl: 'http://settings/v1/systemone', apiKey: 's-key' });
+    expect(
+      await withEnv(
+        envSource({ LAYA_API_KEY: 'env-key' }),
+        resolveHookConfig({ apiKey: 'opt', baseUrl: 'http://opt/v1/systemone' }),
+      ),
+    ).toMatchObject({ baseUrl: 'http://opt/v1/systemone', apiKey: 'opt' });
+  });
+});
+
+type Handler = (...args: any[]) => Promise<unknown>;
+
+function fakeEngine(fetchImpl: (url: string, init?: unknown) => Promise<unknown>) {
+  const handlers = new Map<string, Handler>();
+  const toasts: string[] = [];
+  const logs: string[] = [];
+  const $ = {
+    env: { get: async () => undefined },
+    settings: { read: async () => ({}) },
+    http: { fetch: fetchImpl },
+    ui: {
+      log: (text: string) => logs.push(text),
+      toast: (text: string) => toasts.push(text),
+    },
+  };
+  const on = (event: string, handler: Handler) => handlers.set(event, handler);
+  return { handlers, toasts, logs, $, on };
+}
+
+describe('session.compact hook', () => {
+  it('falls back to the built-in summary when the Laya server is down', async () => {
+    const engine = fakeEngine(async () => {
+      throw new Error('connect ECONNREFUSED 127.0.0.1:8765');
+    });
+    register(engine.on as never, { preserveRecentMessages: 1 });
+    const event = { messages: transcript() };
+    const builtIn = { summary: 'built-in' };
+    const out = await engine.handlers.get('session.compact')!(engine.$, event, async () => builtIn);
+    expect(out).toBe(builtIn);
+    expect(engine.toasts).toEqual(['fallback to built-in summary (connect ECONNREFUSED 127.0.0.1:8765)']);
+  });
+
+  it('replaces the summary with the pruned history when the reduction is large enough', async () => {
+    const engine = fakeEngine(async (_url, init) => {
+      const response = await layaFetch(() => 0.1)(_url, init as { body?: string });
+      return { ...response, headers: {} };
+    });
+    register(engine.on as never, { preserveRecentMessages: 1, minReductionRatio: 0.1 });
+    const out = (await engine.handlers.get('session.compact')!(
+      engine.$,
+      { messages: transcript() },
+      async () => ({ summary: 'built-in' }),
+    )) as { messages: SessionMessage[] };
+    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-5', 'h-6']);
+    expect(engine.toasts[0]).toMatch(/^kept 3\/7 messages, no summary \(/);
   });
 });

@@ -9,11 +9,11 @@ import type {
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import { buildLayaRequest, DEFAULT_MODEL, parseLayaResponse } from '../src/request.js';
 import type {
   CompactOptions,
   CompactResult,
-  JevAsker,
+  LayaAsker,
   Message,
   ToolResult,
   ToolUse,
@@ -41,6 +41,7 @@ export type HookFetchResponse = {
 export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetchResponse>;
 
 export type HookConfig = CompactOptions & {
+  baseUrl?: string;
   apiKey?: string;
   compactAtPercent: number;
   minReductionRatio: number;
@@ -64,8 +65,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     'keepThreshold',
     'preserveRecentMessages',
     'maxStateTokens',
-    'maxRequestTokens',
     'truncateHeadChars',
+    'concurrency',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
@@ -80,6 +81,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
   };
+  const baseUrl = optionString(options, 'baseUrl');
+  if (baseUrl) config.baseUrl = baseUrl;
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
   const goal = optionString(options, 'goal');
@@ -87,17 +90,20 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   return config;
 }
 
-/** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+/** A `LayaAsker` over the engine's `$.http.fetch`; the key is optional. */
+export function layaAsker(
+  fetchFn: HookFetch,
+  params: { baseUrl?: string; apiKey?: string; model: string },
+): LayaAsker {
   return {
     async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
+      const request = buildLayaRequest(params, state, questions);
       const response = await fetchFn(request.url, {
         method: request.method,
         headers: request.headers,
         body: request.body,
       });
-      return parseJevResponse(response.status, response.ok, response.text);
+      return parseLayaResponse(response.status, response.ok, response.text);
     },
   };
 }
@@ -161,14 +167,18 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-/** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
+/** Runs the library over a session transcript; throws when Laya fails or is unreachable. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const asker = layaAsker(fetchFn, {
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey,
+    model: config.model,
+  });
+  const result = await compact(messages, asker, config);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -184,9 +194,10 @@ export function summarize(result: CompactResult): string {
     stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
   ].filter(Boolean);
+  const truncated = stats.truncatedRequests > 0 ? `, ${stats.truncatedRequests} truncated by Laya` : '';
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+  }; ${stats.requests} request(s), state <=~${stats.stateTokens} tokens${truncated}`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -224,23 +235,34 @@ export function decisionLogLines(
   );
 }
 
-async function getApiKey(
-  $: {
-    env: { get: (name: string) => Promise<string | undefined> };
-    settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
-  },
-  config: HookConfig,
-): Promise<string | undefined> {
-  if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
-  if (fromEnv) return fromEnv;
-  const settings = await $.settings.read();
+type EnvSource = {
+  env: { get: (name: string) => Promise<string | undefined> };
+  settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
+};
+
+function settingsEnv(settings: Readonly<Record<string, unknown>>, name: string): string | undefined {
   const env = settings['env'];
-  if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
-    if (typeof value === 'string' && value) return value;
-  }
-  return undefined;
+  if (!env || typeof env !== 'object') return undefined;
+  const value = (env as Record<string, unknown>)[name];
+  return typeof value === 'string' && value ? value : undefined;
+}
+
+/**
+ * Fills `baseUrl` and `apiKey` from the plugin options, then `LAYA_BASE_URL` /
+ * `LAYA_API_KEY` in the environment, then the `env` block of the settings.
+ * Both stay unset when nothing supplies them (local server, no auth).
+ */
+export async function withEnv($: EnvSource, config: HookConfig): Promise<HookConfig> {
+  // `$.env.get` takes string literals only, so each name is spelled out.
+  const baseUrl = config.baseUrl ?? (await $.env.get('LAYA_BASE_URL'));
+  const apiKey = config.apiKey ?? (await $.env.get('LAYA_API_KEY'));
+  const settings = baseUrl && apiKey ? {} : await $.settings.read();
+  const resolved = { ...config };
+  const url = baseUrl || settingsEnv(settings, 'LAYA_BASE_URL');
+  const key = apiKey || settingsEnv(settings, 'LAYA_API_KEY');
+  if (url) resolved.baseUrl = url;
+  if (key) resolved.apiKey = key;
+  return resolved;
 }
 
 function notify(
@@ -262,7 +284,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
+      const config = await withEnv($, configured);
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
