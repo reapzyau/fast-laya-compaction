@@ -1,6 +1,6 @@
 {
   "name": "fast-laya-compaction",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Verbatim Laya-guided compaction for Claude Code sessions, judged by a local open-weights model.",
   "license": "MIT",
   "userConfig": {
