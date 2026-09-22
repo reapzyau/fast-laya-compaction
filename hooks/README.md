@@ -13,8 +13,8 @@ one request with two questions (should the call stay, should its full output
 stay) and a **focused state** built for that call: the goal, the call itself,
 the start of its result, and what happened after it (later calls on the same
 input first, then the newest events). The state is plain text fitted into
-`maxStateTokens`, which defaults from the model (320 tokens for
-`laya-english`, 768 for the 1024-token models), because Laya evaluates each
+`maxStateTokens`, which defaults from the model (768 tokens for the
+1024-token models, 320 for `laya-english`), because Laya evaluates each
 question in its own small window. Requests run `concurrency` at a time. An
 item is kept when Laya's probability reaches `keepThreshold`; a dropped result
 is truncated to its first `truncateHeadChars` characters plus a one-line note,
@@ -50,12 +50,12 @@ The plugin declares these `userConfig` values in
 | --- | ---: |
 | `baseUrl` | `LAYA_BASE_URL`, else `http://127.0.0.1:8765/v1/systemone` |
 | `apiKey` | `LAYA_API_KEY`, else none |
-| `model` | `laya-english` |
+| `model` | `laya-typed-decisions` |
 | `keepThreshold` | `0.5` |
 | `preserveRecentMessages` | `6` |
 | `compactAtPercent` | `60` |
 | `minReductionRatio` | `0.25` |
-| `maxStateTokens` | from the model (`320` / `768`) |
+| `maxStateTokens` | from the model (`768` / `320`) |
 | `truncateHeadChars` | `300` |
 | `concurrency` | `8` |
 

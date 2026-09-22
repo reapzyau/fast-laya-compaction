@@ -77,9 +77,9 @@ export interface CompactOptions {
   keepThreshold?: number;
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;
-  /** Laya model; only used here to pick the default `maxStateTokens`. Default `laya-english`. */
+  /** Laya model; only used here to pick the default `maxStateTokens`. Default `laya-typed-decisions`. */
   model?: string;
-  /** Estimated token ceiling for each per-call state. Defaults from the model (320 for `laya-english`). */
+  /** Estimated token ceiling for each per-call state. Defaults from the model (768 for `laya-typed-decisions`). */
   maxStateTokens?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;

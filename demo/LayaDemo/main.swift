@@ -206,7 +206,7 @@ final class Demo: ObservableObject {
 
             phase = .scanning
             let candidates = candidateCalls.count
-            status = "✻ Asking laya-english \(candidates * 2) questions (\(candidates) tool calls × keep call? + keep result?) · state = focused per call · \(candidates) requests"
+            status = "✻ Asking laya-typed-decisions \(candidates * 2) questions (\(candidates) tool calls × keep call? + keep result?) · state = focused per call · \(candidates) requests"
             try await sleep(0.9)
 
             for chunk in transcript {
@@ -472,7 +472,7 @@ struct TerminalView: View {
             HStack(spacing: 0) {
                 Text("  compaction: ").foregroundStyle(Palette.dim)
                 Text("fast-laya-compaction").foregroundStyle(Palette.cyan)
-                Text(" · laya-english · verbatim, no summaries").foregroundStyle(Palette.dim)
+                Text(" · laya-typed-decisions · verbatim, no summaries").foregroundStyle(Palette.dim)
             }
         }
         .font(mono)

@@ -33,9 +33,9 @@ together**:
 
 | Model | Window per question | State room (default `maxStateTokens`) |
 | --- | ---: | ---: |
-| `laya-english` (default) | 512 | 320 |
+| `laya-typed-decisions` (default) | 1024 | 768 |
 | `laya-multilingual` | 1024 | 768 |
-| `laya-typed-decisions` | 1024 | 768 |
+| `laya-english` | 512 | 320 |
 | `laya` (router → English or multilingual) | treat as 512 | 320 |
 
 Anything over is cut by the server, which reports it with a `truncation` key in
@@ -66,10 +66,14 @@ leave Laya nearly blind, so this port replaces the whole-history state with a
    Tokens are estimated without a tokenizer (a word per six letters, half a
    token per digit, ~one per other symbol), calibrated upstream to land a
    little above real counts.
-3. Each call gets one request with two short `noul` questions, `call_tN`
-   ("the assistant still needs to remember this tool call and its input") and
-   `result_tN` ("the assistant still needs this tool call's full output
-   verbatim"). Requests run `concurrency` at a time (8 by default).
+3. Each call gets one request with two short `noul` questions, `call_tN` ("the
+   fact that this tool call was made, with its input, must stay in the
+   history") and `result_tN` ("the full output of this tool call must stay in
+   the history word for word"). Both carry a `criteria.true` and a
+   `criteria.false` line saying what each side looks like — that wording is
+   worth 4 of the 18 labelled cases below. The call's id, tool and result size
+   stay in the state, never in the question. Requests run `concurrency` at a
+   time (8 by default).
 4. Decisions per call, against `keepThreshold`:
    - `keepResult ≥ threshold` → keep call and result;
    - else `keepCall ≥ threshold` → keep the call, truncate the result to its
@@ -82,8 +86,9 @@ leave Laya nearly blind, so this port replaces the whole-history state with a
 Laya failures (server down, HTTP errors, malformed answers) throw; the caller
 (or the Claude Code hook) decides what to fall back to.
 
-A focused state from the 40-call session in the tests, 312 of 320 estimated
-tokens (the goal line is shortened here):
+A focused state from the 40-call session in the tests, 312 estimated tokens
+against the narrower 320-token `laya-english` budget (the goal line is
+shortened here):
 
 ```text
 Goal: Fix the failing parser test in the checkout service. Do not touch legacy/. … Looks close. Run the whole suite and then write the changelog entry.
@@ -98,6 +103,55 @@ assistant: Step 39: the token loop in README.md stops one token early when a com
 user: Looks close. Run the whole suite and then write the changelog entry.
 ```
 
+## Does it work?
+
+`bench/` holds 18 labelled focused states of the shape above — nine whose tool
+result must survive compaction, nine whose result is safe to delete (superseded
+reads, finished tasks, abandoned paths, duplicate fetches). `npm run bench`
+scores a model and a question wording against them, one request per case,
+against your own server:
+
+```sh
+npm run bench                                         # the four rows below
+npm run bench -- --models=laya-typed-decisions --wordings=criteria
+npm run bench:transcript -- ~/.claude/projects/<project>/<session>.jsonl 300
+```
+
+| model | question wording | correct | separation |
+| --- | --- | ---: | ---: |
+| `laya-typed-decisions` (default) | criteria (default) | **14/18** | 0.020 |
+| `laya-typed-decisions` | plain | 10/18 | −0.005 |
+| `laya-english` | plain (the old default) | 10/18 | −0.054 |
+| `laya-english` | criteria | 7/18 | −0.049 |
+
+"criteria" is the shipped wording: each question carries a `criteria.true` and
+a `criteria.false` line. "plain" is the single-instruction wording it replaced.
+The winning pair gets all nine drop cases right; its four misses are all keeps
+it would have deleted.
+
+On a real 300-message Claude Code transcript (573k characters, 97 tool calls),
+the defaults cut **23.7%** of the characters against **5.7%** for the old
+`laya-english` + plain configuration, and dropped no tool call at all — the
+whole saving came from truncating results.
+
+Honest about what that means:
+
+- The separation between the two classes is only ~0.02. The ranking is right
+  far more often than the absolute probabilities are; a `keepThreshold` tuned
+  away from 0.5 will move the score around a lot.
+- Laya errs toward deleting things still needed. All four misses of the winning
+  configuration are keep cases scored just under the threshold (0.46–0.48), and
+  a deleted result is only recoverable by re-running the tool.
+- 23.7% on a real session sits just *under* the plugin's `minReductionRatio`
+  fallback floor of `0.25`, so that very session would still have fallen back
+  to Claude Code's built-in summary. The new defaults move the typical session
+  from nowhere near the floor to right on it; they do not clear it by a
+  comfortable margin. Lower `minReductionRatio` if you would rather keep a 20%
+  verbatim history than take a summary.
+- 18 cases is a small, hand-written bench written by the same person who chose
+  the wording. Treat it as a regression guard, not as evidence of a general
+  capability.
+
 ## Running Laya locally
 
 Laya is served by [laya-server](https://github.com/noahbclarkson/laya-server),
@@ -108,7 +162,7 @@ git clone https://github.com/noahbclarkson/laya-server ~/laya-server && cd ~/lay
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cu128   # or the CPU wheel
 uv pip install --python .venv/bin/python -r requirements.txt
-.venv/bin/python server.py --models english          # listens on 127.0.0.1:8765
+.venv/bin/python server.py --models typed-decisions  # listens on 127.0.0.1:8765
 ```
 
 Or with Docker: `docker compose up -d` in that repository.
@@ -159,12 +213,12 @@ building blocks (`collectToolCalls`, `focusedState`, `questionsFor`,
 | --- | --- | --- |
 | `baseUrl` | `LAYA_BASE_URL`, else `http://127.0.0.1:8765/v1/systemone` | System One endpoint (`compactMessages`/`LayaClient`) |
 | `apiKey` | `LAYA_API_KEY`, else none | Optional bearer token; no `authorization` header without one |
-| `model` | `laya-english` | Laya model; also picks the default `maxStateTokens` |
+| `model` | `laya-typed-decisions` | Laya model; also picks the default `maxStateTokens` |
 | `fetch` | native `fetch` | Injectable fetch implementation for tests |
 | `goal` | last 3 user prompts | Ongoing task description included in each state |
 | `keepThreshold` | `0.5` | Minimum keep probability for a call or result to stay |
 | `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
-| `maxStateTokens` | from `model` (`320` / `768`) | Estimated token ceiling for each per-call state |
+| `maxStateTokens` | from `model` (`768` / `320`) | Estimated token ceiling for each per-call state |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
 | `concurrency` | `8` | Laya requests in flight at once |
 
@@ -175,11 +229,11 @@ per-reason decision counts, `requests` (one per candidate call),
 
 ## Limitations
 
-- Laya judges each call from a ~320-token summary with `laya-english` (~768 with
-  the 1024-token models). It sees the goal, the call, the start of its result
-  and the most relevant later events, never the whole session. Expect it to be
-  less sure than a model that reads everything; tune `keepThreshold`, or use a
-  larger-window model, if it drops too much.
+- Laya judges each call from a ~768-token summary with the 1024-token models
+  (~320 with `laya-english`). It sees the goal, the call, the start of its
+  result and the most relevant later events, never the whole session. Expect it
+  to be less sure than a model that reads everything; tune `keepThreshold` if
+  it drops too much.
 - If the estimate undercounts and the server truncates anyway, the request
   still answers but is counted in `truncatedRequests` (and shown in the hook's
   toast).
@@ -223,7 +277,8 @@ claude plugin install fast-laya-compaction@fast-laya-compaction
 
 The install prompts for the plugin options (server URL, optional key, model,
 thresholds, …); leave them unset or at their defaults for a local
-`laya-english` server. Restart Claude Code or run `/reload-plugins`. From then
+`laya-typed-decisions` server. Restart Claude Code or run `/reload-plugins`.
+From then
 on `/compact` (and auto-compaction) goes through Laya: the toast reads
 `kept N/M messages, no summary (…)` when the pruned history replaced the
 built-in summary, or `fallback to built-in summary (…)` when Laya could not
@@ -243,10 +298,12 @@ npm test
 npm run build
 npm run validate:plugin  # claude plugin validate
 npm run demo             # needs a running laya-server
+npm run bench            # needs a running laya-server; see "Does it work?"
+npm run bench:transcript -- <path-to-session.jsonl> [limit]
 ```
 
-The unit tests use a fake Laya and never touch the network. The demo is the
-live check against your local server.
+The unit tests use a fake Laya and never touch the network. The demo and the
+two bench commands are the live checks against your local server.
 
 ## Animated demo (macOS)
 

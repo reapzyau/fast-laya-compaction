@@ -4,7 +4,7 @@ import type { LayaAsker, LayaQuestions, LayaResponse, LayaState } from './types.
 export interface LayaClientOptions {
   /** Optional; defaults to `process.env.LAYA_API_KEY`. Sent as a bearer token only when set. */
   apiKey?: string;
-  /** Defaults to `laya-english`. */
+  /** Defaults to `laya-typed-decisions`. */
   model?: string;
   /** Defaults to `process.env.LAYA_BASE_URL`, then `http://127.0.0.1:8765/v1/systemone`. */
   baseUrl?: string;

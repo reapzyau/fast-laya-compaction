@@ -13,6 +13,7 @@ import {
   mapLimit,
   MODEL_STATE_TOKENS,
   parseLayaResponse,
+  questionsFor,
   reductionRatio,
   resolveOptions,
   stateTokensFor,
@@ -113,16 +114,17 @@ describe('options', () => {
       goal: '',
       keepThreshold: 0.5,
       preserveRecentMessages: 6,
-      maxStateTokens: 320,
+      maxStateTokens: 768,
       truncateHeadChars: 300,
       concurrency: 8,
     });
+    expect(resolveOptions({ model: 'laya-english' }).maxStateTokens).toBe(320);
     expect(resolveOptions({ model: 'laya-multilingual' }).maxStateTokens).toBe(768);
     expect(resolveOptions({ model: 'laya-typed-decisions' }).maxStateTokens).toBe(768);
     expect(resolveOptions({ model: 'laya' }).maxStateTokens).toBe(320);
     expect(resolveOptions({ model: 'something-else' }).maxStateTokens).toBe(320);
     expect(resolveOptions({ model: 'laya-multilingual', maxStateTokens: 500 }).maxStateTokens).toBe(500);
-    expect(stateTokensFor(undefined)).toBe(MODEL_STATE_TOKENS['laya-english']);
+    expect(stateTokensFor(undefined)).toBe(MODEL_STATE_TOKENS['laya-typed-decisions']);
     expect(resolveOptions({
       keepThreshold: Number.NaN,
       preserveRecentMessages: 2.7,
@@ -310,6 +312,34 @@ describe('decisions', () => {
   });
 });
 
+describe('questionsFor', () => {
+  it('asks both sides with criteria and keeps the call context out of the question text', () => {
+    const questions = questionsFor({ id: 't7' });
+    expect(Object.keys(questions)).toEqual(['call_t7', 'result_t7']);
+    expect(questions.call_t7).toEqual({
+      type: 'noul',
+      instructions: 'The fact that this tool call was made, with its input, must stay in the history.',
+      criteria: {
+        true: 'What was asked for still matters for the work that follows.',
+        false: 'The call served a finished or abandoned step; forgetting it costs nothing.',
+      },
+    });
+    expect(questions.result_t7).toEqual({
+      type: 'noul',
+      instructions: 'The full output of this tool call must stay in the history word for word.',
+      criteria: {
+        true:
+          'The assistant will read facts from this output again; the information is not repeated anywhere later and re-running the tool would not recover it.',
+        false:
+          'The output is stale, superseded by a later call, or its task is finished; deleting it costs nothing.',
+      },
+    });
+    for (const question of Object.values(questions)) {
+      expect(JSON.stringify(question)).not.toContain('t7');
+    }
+  });
+});
+
 describe('compact', () => {
   it('sends one request per candidate call with that call\'s two questions', async () => {
     const seen: Seen[] = [];
@@ -377,17 +407,29 @@ describe('compact', () => {
   });
 
   it('keeps every per-call state of a 40-call session under the model budget', async () => {
+    const narrowSeen: Seen[] = [];
+    const narrow = await compact(longTranscript(), fakeLaya(() => 0.9, narrowSeen), {
+      preserveRecentMessages: 6,
+      model: 'laya-english',
+    });
+    expect(narrowSeen.length).toBe(narrow.stats.requests);
+    for (const request of narrowSeen) {
+      expect(estimateTokens(String(request.state))).toBeLessThanOrEqual(320);
+    }
+    expect(narrow.stats.stateTokens).toBeLessThanOrEqual(320);
+
     const seen: Seen[] = [];
     const output = await compact(longTranscript(), fakeLaya(() => 0.9, seen), { preserveRecentMessages: 6 });
     expect(seen.length).toBe(output.stats.requests);
-    for (const request of seen) expect(estimateTokens(String(request.state))).toBeLessThanOrEqual(320);
-    expect(output.stats.stateTokens).toBeLessThanOrEqual(320);
+    for (const request of seen) expect(estimateTokens(String(request.state))).toBeLessThanOrEqual(768);
+    expect(output.stats.stateTokens).toBeLessThanOrEqual(768);
+    expect(output.stats.stateTokens).toBeGreaterThan(narrow.stats.stateTokens);
 
     const wide = await compact(longTranscript(), fakeLaya(() => 0.9), {
       preserveRecentMessages: 6,
       model: 'laya-multilingual',
     });
-    expect(wide.stats.stateTokens).toBeGreaterThan(output.stats.stateTokens);
+    expect(wide.stats.stateTokens).toBeGreaterThan(narrow.stats.stateTokens);
     expect(wide.stats.stateTokens).toBeLessThanOrEqual(768);
   });
 
@@ -426,7 +468,7 @@ describe('HTTP client', () => {
     const open = buildLayaRequest({}, 'state', questions);
     expect(open.url).toBe('http://127.0.0.1:8765/v1/systemone');
     expect(open.headers).toEqual({ 'content-type': 'application/json' });
-    expect(JSON.parse(open.body)).toEqual({ model: 'laya-english', state: 'state', questions });
+    expect(JSON.parse(open.body)).toEqual({ model: 'laya-typed-decisions', state: 'state', questions });
 
     const keyed = buildLayaRequest({ apiKey: 'k', baseUrl: 'http://gpu:9000/v1/systemone', model: 'laya' }, 'state', questions);
     expect(keyed.headers.authorization).toBe('Bearer k');

@@ -18,8 +18,8 @@
     "model": {
       "type": "string",
       "title": "Laya model",
-      "description": "laya-english (512-token window), laya-multilingual or laya-typed-decisions (1024), or the laya router.",
-      "default": "laya-english"
+      "description": "laya-typed-decisions or laya-multilingual (1024-token window), laya-english (512), or the laya router.",
+      "default": "laya-typed-decisions"
     },
     "keepThreshold": {
       "type": "number",
@@ -48,7 +48,7 @@
     "maxStateTokens": {
       "type": "number",
       "title": "Maximum state tokens per call",
-      "description": "Estimated token budget for the focused state sent with each call's questions. Leave unset to use the model's default (320 for laya-english, 768 for the 1024-token models)."
+      "description": "Estimated token budget for the focused state sent with each call's questions. Leave unset to use the model's default (768 for the 1024-token models, 320 for laya-english)."
     },
     "truncateHeadChars": {
       "type": "number",

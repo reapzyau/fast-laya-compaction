@@ -57,7 +57,7 @@ function layaFetch(answer: (name: string) => number, sent: Sent[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'laya-english' });
+    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'laya-typed-decisions' });
     expect(
       resolveHookConfig({
         baseUrl: 'http://gpu:8765/v1/systemone',

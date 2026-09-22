@@ -2,7 +2,7 @@ import type { LayaAnswer, LayaQuestions, LayaResponse, LayaState } from './types
 
 /** Where `laya-server` listens by default. */
 export const SYSTEM_ONE_URL = 'http://127.0.0.1:8765/v1/systemone';
-export const DEFAULT_MODEL = 'laya-english';
+export const DEFAULT_MODEL = 'laya-typed-decisions';
 
 /**
  * Approximate state room per question for each Laya model: every question is

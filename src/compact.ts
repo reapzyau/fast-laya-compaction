@@ -53,19 +53,33 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
 
 /**
  * The two `noul` questions asked about one call: keep the call, keep its
- * result. Short, because each question shares Laya's small window with the state.
+ * result. Short, because each question shares Laya's small window with the
+ * state; the call's id, tool and size stay in that state, never in the question
+ * text. Each question carries `criteria` for the true and the false side, which
+ * is what separates the two classes on the labelled cases in `bench/` (14/18
+ * with, 10/18 without).
  */
 export function questionsFor(call: Pick<ToolCall, 'id'>): LayaQuestions {
   return {
     [`call_${call.id}`]: {
       type: 'noul',
       instructions:
-        'The assistant still needs to remember this tool call and its input for what it does next.',
+        'The fact that this tool call was made, with its input, must stay in the history.',
+      criteria: {
+        true: 'What was asked for still matters for the work that follows.',
+        false: 'The call served a finished or abandoned step; forgetting it costs nothing.',
+      },
     },
     [`result_${call.id}`]: {
       type: 'noul',
       instructions:
-        "The assistant still needs this tool call's full output verbatim; re-running the tool would not do.",
+        'The full output of this tool call must stay in the history word for word.',
+      criteria: {
+        true:
+          'The assistant will read facts from this output again; the information is not repeated anywhere later and re-running the tool would not recover it.',
+        false:
+          'The output is stale, superseded by a later call, or its task is finished; deleting it costs nothing.',
+      },
     },
   };
 }
