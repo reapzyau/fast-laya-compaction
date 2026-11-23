@@ -299,6 +299,6 @@ export function fitState(
   if (fits()) return fitted(history, tokens, 'old calls merged');
 
   throw new Error(
-    `history too large for Jev (~${tokens} tokens after truncation, limit ${options.maxStateTokens})`,
+    `history too large for Clef (~${tokens} tokens after truncation, limit ${options.maxStateTokens})`,
   );
 }

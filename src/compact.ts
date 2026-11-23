@@ -18,10 +18,15 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   goal: '',
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
-  maxStateTokens: 25_000,
-  maxRequestTokens: 30_000,
+  // Clef reads 65,536 tokens; the estimator is calibrated against Jev, not
+  // Clef's tokenizer, so these leave ~10k of headroom.
+  maxStateTokens: 45_000,
+  maxRequestTokens: 55_000,
   truncateHeadChars: 300,
 };
+
+/** Clef takes 1 to 64 questions per request, and every call asks two. */
+export const MAX_CALLS_PER_REQUEST = 32;
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
 const REQUEST_OVERHEAD_TOKENS = 20;
@@ -81,7 +86,10 @@ export function batchCalls(
   let currentTokens = 0;
   for (const call of calls) {
     const tokens = estimateTokens(JSON.stringify(questionsFor(call)));
-    if (current.length > 0 && currentTokens + tokens > budget) {
+    if (
+      current.length > 0 &&
+      (currentTokens + tokens > budget || current.length >= MAX_CALLS_PER_REQUEST)
+    ) {
       batches.push(current);
       current = [];
       currentTokens = 0;
@@ -135,7 +143,7 @@ async function askBatch(
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
   if (text.length <= headChars + 120) return text;
   const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
+  return `${head}[fast-clef-compaction truncated ${text.length - headChars} chars of this tool result${
     isError ? ' (error)' : ''
   }; re-run the tool if needed]`;
 }

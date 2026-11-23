@@ -76,8 +76,8 @@ describe('options', () => {
     expect(resolveOptions()).toMatchObject({
       keepThreshold: 0.5,
       preserveRecentMessages: 6,
-      maxStateTokens: 25_000,
-      maxRequestTokens: 30_000,
+      maxStateTokens: 45_000,
+      maxRequestTokens: 55_000,
       truncateHeadChars: 300,
     });
     expect(resolveOptions({
@@ -253,6 +253,12 @@ describe('question batching', () => {
   it('throws when a single question does not fit', () => {
     expect(() => batchCalls(calls, 29_990, options)).toThrow(/no room/);
   });
+
+  it('never puts more than 64 questions (32 calls) in one request', () => {
+    const many = Array.from({ length: 70 }, (_, i) => ({ ...calls[0]!, id: `t${i + 1}` }));
+    const batches = batchCalls(many, 1000, options);
+    expect(batches.map((b) => b.length)).toEqual([32, 32, 6]);
+  });
 });
 
 describe('decisions', () => {
@@ -294,10 +300,10 @@ describe('decisions', () => {
     expect(kept[0]).toBe(messages[0]);
     expect(kept[2]).not.toBe(messages[4]);
     expect(kept[2]?.toolUses[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
+      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-clef-compaction truncated 1700 chars`),
     );
     expect(kept[3]?.toolResults?.[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
+      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-clef-compaction truncated 1700 chars`),
     );
     expect(kept[2]).not.toBe(messages[4]);
     expect(kept[3]).not.toBe(messages[5]);
@@ -321,13 +327,13 @@ describe('decisions', () => {
 
     const kept = applyDecisions(messages, decisions, calls, 50);
     expect(kept[2]?.toolResults?.[0]?.text).toBe(
-      `${original.slice(0, 50)}\n[fast-jev-compaction truncated ${total - 50} chars of this tool result; re-run the tool if needed]`,
+      `${original.slice(0, 50)}\n[fast-clef-compaction truncated ${total - 50} chars of this tool result; re-run the tool if needed]`,
     );
     expect(kept[1]?.toolUses[0]?.text).toBe(kept[2]?.toolResults?.[0]?.text);
 
     const noHead = applyDecisions(messages, decisions, calls, 0);
     expect(noHead[2]?.toolResults?.[0]?.text).toBe(
-      `[fast-jev-compaction truncated ${total} chars of this tool result; re-run the tool if needed]`,
+      `[fast-clef-compaction truncated ${total} chars of this tool result; re-run the tool if needed]`,
     );
   });
 });
@@ -384,23 +390,29 @@ describe('compact', () => {
       ask: async () => ({ answers: { call_t1: { noul: 0.5 } } }),
     };
     await expect(compact(transcript(), broken, { preserveRecentMessages: 1 })).rejects.toThrow(
-      /Invalid Jev answer/,
+      /Invalid Clef answer/,
     );
   });
 });
 
 describe('HTTP client', () => {
-  it('builds a System One request', () => {
-    const request = buildJevRequest({ apiKey: 'k' }, { a: 1 }, {
+  it('builds a Workers AI Clef request', () => {
+    const request = buildJevRequest({ apiKey: 'k', accountId: 'acc' }, { a: 1 }, {
       q: { type: 'noul', instructions: 'x' },
     });
-    expect(request.url).toBe('https://api.typesafe.ai/v1/systemone');
+    expect(request.url).toBe(
+      'https://api.cloudflare.com/client/v4/accounts/acc/ai/run/@cf/cloudflare/clef',
+    );
     expect(request.headers.authorization).toBe('Bearer k');
     expect(JSON.parse(request.body)).toEqual({
-      model: 'jev-latest',
+      model: 'clef',
       state: { a: 1 },
       questions: { q: { type: 'noul', instructions: 'x' } },
     });
+    expect(
+      buildJevRequest({ apiKey: 'k', accountId: 'acc', model: 'clef-flash' }, 's', {}).url,
+    ).toMatch(/@cf\/cloudflare\/clef-flash$/);
+    expect(() => buildJevRequest({ apiKey: 'k' }, 's', {})).toThrow(/CLOUDFLARE_ACCOUNT_ID/);
   });
 
   it('rejects failed and malformed responses', () => {
@@ -410,24 +422,36 @@ describe('HTTP client', () => {
     expect(parseJevResponse(200, true, '{"answers":{}}')).toEqual({ answers: {} });
   });
 
+  it('unwraps the Workers AI REST envelope', () => {
+    const body = '{"result":{"answers":{"q":{"noul":0.7}}},"success":true,"errors":[]}';
+    expect(parseJevResponse(200, true, body)).toEqual({ answers: { q: { noul: 0.7 } } });
+    expect(() => parseJevResponse(200, true, '{"result":{}}')).toThrow(/missing answers/);
+  });
+
   it('asks over fetch and refuses to run without a key', async () => {
     const bodies: string[] = [];
+    const urls: string[] = [];
     const client = new JevClient({
       apiKey: 'k',
-      model: 'jev-test',
-      fetch: (async (_url: string | URL | Request, init?: RequestInit) => {
+      accountId: 'acc',
+      model: 'clef-flash',
+      fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+        urls.push(String(url));
         bodies.push(String(init?.body));
-        return new Response(JSON.stringify({ answers: { q: { noul: 0.4 } } }), { status: 200 });
+        return new Response(JSON.stringify({ result: { answers: { q: { noul: 0.4 } } } }), {
+          status: 200,
+        });
       }) as typeof fetch,
     });
     const response = await client.ask('state', { q: { type: 'noul', instructions: 'x' } });
     expect(response.answers.q).toEqual({ noul: 0.4 });
-    expect(JSON.parse(bodies[0]!).model).toBe('jev-test');
+    expect(JSON.parse(bodies[0]!).model).toBe('clef-flash');
+    expect(urls[0]).toMatch(/accounts\/acc\/ai\/run\/@cf\/cloudflare\/clef-flash$/);
 
     const keyless = new JevClient({ apiKey: '' });
-    await expect(keyless.ask('s', {})).rejects.toThrow(/TYPESAFE_API_KEY/);
+    await expect(keyless.ask('s', {})).rejects.toThrow(/CLEF_API_TOKEN/);
     await expect(
       compactMessages(transcript(), { apiKey: '', preserveRecentMessages: 1 }),
-    ).rejects.toThrow(/TYPESAFE_API_KEY/);
+    ).rejects.toThrow(/CLEF_API_TOKEN/);
   });
 });

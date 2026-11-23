@@ -1,19 +1,24 @@
 {
-  "name": "fast-jev-compaction",
-  "version": "0.3.0",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "name": "fast-clef-compaction",
+  "version": "0.3.0-clef.1",
+  "description": "Verbatim compaction for Claude Code sessions, judged by Cloudflare's Clef decision model on Workers AI.",
   "license": "MIT",
   "userConfig": {
     "apiKey": {
       "type": "string",
-      "title": "TypeSafe API key",
-      "description": "TypeSafe API key. Leave unset to use TYPESAFE_API_KEY.",
+      "title": "Cloudflare API token",
+      "description": "Cloudflare API token with Workers AI access. Leave unset to use CLEF_API_TOKEN.",
       "sensitive": true
+    },
+    "accountId": {
+      "type": "string",
+      "title": "Cloudflare account ID",
+      "description": "Account that runs Workers AI. Leave unset to use CLOUDFLARE_ACCOUNT_ID."
     },
     "keepThreshold": {
       "type": "number",
       "title": "Keep threshold",
-      "description": "Minimum Jev probability that a tool call or tool result is still needed; below it the item is removed.",
+      "description": "Minimum Clef probability that a tool call or tool result is still needed; below it the item is removed.",
       "default": 0.5
     },
     "preserveRecentMessages": {
@@ -36,27 +41,27 @@
     },
     "maxStateTokens": {
       "type": "number",
-      "title": "Maximum Jev state tokens",
-      "description": "Estimated token budget for the conversation state sent with every Jev request.",
-      "default": 25000
+      "title": "Maximum Clef state tokens",
+      "description": "Estimated token budget for the conversation state sent with every Clef request.",
+      "default": 45000
     },
     "maxRequestTokens": {
       "type": "number",
-      "title": "Maximum Jev request tokens",
-      "description": "Estimated token budget for state plus questions in one Jev request.",
-      "default": 30000
+      "title": "Maximum Clef request tokens",
+      "description": "Estimated token budget for state plus questions in one Clef request (Clef reads 65,536).",
+      "default": 55000
     },
     "truncateHeadChars": {
       "type": "number",
       "title": "Truncated tool result head",
-      "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
+      "description": "Characters of a tool result kept when Clef decides its full output is no longer needed; 0 keeps only the note.",
       "default": 300
     },
     "model": {
       "type": "string",
-      "title": "Jev model",
-      "description": "TypeSafe Jev model name.",
-      "default": "jev-latest"
+      "title": "Clef model",
+      "description": "clef (US$0.24 per million input tokens) or clef-flash (US$0.038).",
+      "default": "clef"
     }
   }
 }

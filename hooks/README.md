@@ -1,4 +1,15 @@
-# fast-jev-compaction Claude Code mod
+# fast-clef-compaction Claude Code mod
+
+> **Fork note (branch `clef`).** This fork of
+> [tamaratran/fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction)
+> asks Cloudflare's Clef decision model on Workers AI instead of TypeSafe Jev.
+> Clef takes the same `state` + `questions` request. What changed: the
+> endpoint (`/accounts/<id>/ai/run/@cf/cloudflare/<model>`), auth (a Cloudflare
+> API token with Workers AI access in `CLEF_API_TOKEN`, account in
+> `CLOUDFLARE_ACCOUNT_ID`), the default model (`clef`; `clef-flash` is cheaper),
+> the Workers AI `{ result: … }` envelope, a 64-question cap per request, and
+> bigger budgets for Clef's 65,536-token window. Internal names still say Jev.
+> Below, read "Clef" wherever the text says "Jev".
 
 This plugin uses Claude Code function hooks to replace a compaction with the
 original messages, minus the tool calls and tool results Jev judged no longer
@@ -29,10 +40,11 @@ hooks surface before installing or loading it:
 
 ```sh
 export CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1
-export TYPESAFE_API_KEY="<your TypeSafe key>"
+export CLEF_API_TOKEN="<Cloudflare API token with Workers AI access>"
+export CLOUDFLARE_ACCOUNT_ID="<account id>"
 
-claude plugin marketplace add tamaratran/fast-jev-compaction
-claude plugin install fast-jev-compaction@fast-jev-compaction
+claude plugin marketplace add reapzyau/fast-laya-compaction#clef
+claude plugin install fast-clef-compaction@fast-clef-compaction
 ```
 
 For local development:
@@ -52,13 +64,14 @@ The plugin declares these `userConfig` values in
 | `preserveRecentMessages` | `6` |
 | `compactAtPercent` | `60` |
 | `minReductionRatio` | `0.25` |
-| `maxStateTokens` | `25000` |
-| `maxRequestTokens` | `30000` |
+| `maxStateTokens` | `45000` |
+| `maxRequestTokens` | `55000` |
 | `truncateHeadChars` | `300` |
-| `model` | `jev-latest` |
+| `model` | `clef` |
+| `accountId` | `CLOUDFLARE_ACCOUNT_ID` |
 
-The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
-through `TYPESAFE_API_KEY`. The environment variable is the recommended
+The Cloudflare token can be supplied as the sensitive `apiKey` plugin option or
+through `CLEF_API_TOKEN`. The environment variable is the recommended
 development setup.
 
 Every option except `apiKey`, `compactAtPercent`, `minReductionRatio` and

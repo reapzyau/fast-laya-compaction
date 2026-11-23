@@ -1,7 +1,12 @@
 import type { JevAnswer, JevQuestions, JevResponse, JevState } from './types.js';
 
-export const SYSTEM_ONE_URL = 'https://api.typesafe.ai/v1/systemone';
-export const DEFAULT_MODEL = 'jev-latest';
+/** `clef` or `clef-flash`; both speak the Jev request format. */
+export const DEFAULT_MODEL = 'clef';
+
+/** The Workers AI endpoint for one Clef model on one Cloudflare account. */
+export function clefUrl(accountId: string, model: string = DEFAULT_MODEL): string {
+  return `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/@cf/cloudflare/${model}`;
+}
 
 export interface JevRequest {
   url: string;
@@ -10,54 +15,61 @@ export interface JevRequest {
   body: string;
 }
 
-/** The HTTP request for one Jev call, for any fetch-like transport. */
+/** The HTTP request for one Clef call, for any fetch-like transport. */
 export function buildJevRequest(
   params: {
+    /** Cloudflare API token with Workers AI access. */
     apiKey: string;
     model?: string;
+    accountId?: string;
+    /** Overrides the Workers AI URL built from `accountId`. */
     baseUrl?: string;
   },
   state: JevState,
   questions: JevQuestions,
 ): JevRequest {
+  const model = params.model ?? DEFAULT_MODEL;
+  if (!params.baseUrl && !params.accountId) {
+    throw new Error('CLOUDFLARE_ACCOUNT_ID is not configured');
+  }
   return {
-    url: params.baseUrl ?? SYSTEM_ONE_URL,
+    url: params.baseUrl ?? clefUrl(params.accountId!, model),
     method: 'POST',
     headers: {
       authorization: `Bearer ${params.apiKey}`,
       'content-type': 'application/json',
     },
-    body: JSON.stringify({
-      model: params.model ?? DEFAULT_MODEL,
-      state,
-      questions,
-    }),
+    body: JSON.stringify({ model, state, questions }),
   };
 }
 
-/** Validates a Jev response body; throws on anything but an `answers` object. */
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object';
+}
+
+/**
+ * Validates a Clef response body; throws on anything but an `answers` object.
+ * Accepts the bare body and the Workers AI REST envelope (`{ result: { answers } }`).
+ */
 export function parseJevResponse(
   status: number,
   ok: boolean,
   text: string,
 ): JevResponse {
   if (!ok) {
-    throw new Error(`Jev request failed (${status}): ${text.slice(0, 200)}`);
+    throw new Error(`Clef request failed (${status}): ${text.slice(0, 200)}`);
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new Error('Jev returned malformed JSON');
+    throw new Error('Clef returned malformed JSON');
   }
-  if (
-    parsed === null ||
-    typeof parsed !== 'object' ||
-    !('answers' in parsed) ||
-    parsed.answers === null ||
-    typeof parsed.answers !== 'object'
-  ) {
-    throw new Error('Jev response is missing answers');
+  if (isObject(parsed) && !('answers' in parsed) && isObject(parsed.result)) {
+    parsed = parsed.result;
+  }
+  if (!isObject(parsed) || !isObject(parsed.answers)) {
+    throw new Error('Clef response is missing answers');
   }
   return parsed as JevResponse;
 }
@@ -74,7 +86,7 @@ export function noulAnswer(
     typeof answer.noul !== 'number' ||
     !Number.isFinite(answer.noul)
   ) {
-    throw new Error(`Invalid Jev answer for ${name}`);
+    throw new Error(`Invalid Clef answer for ${name}`);
   }
   return answer.noul;
 }

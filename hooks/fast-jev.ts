@@ -42,6 +42,7 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  accountId?: string;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
@@ -82,16 +83,23 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   };
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
+  const accountId = optionString(options, 'accountId');
+  if (accountId) config.accountId = accountId;
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
 }
 
 /** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+export function jevAsker(
+  fetchFn: HookFetch,
+  apiKey: string,
+  model: string,
+  accountId?: string,
+): JevAsker {
   return {
     async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
+      const request = buildJevRequest({ apiKey, model, accountId }, state, questions);
       const response = await fetchFn(request.url, {
         method: request.method,
         headers: request.headers,
@@ -161,14 +169,18 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-/** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
+/** Runs the library over a session transcript; throws when the token is missing or Clef fails. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  if (!config.apiKey) throw new Error('CLEF_API_TOKEN is not configured');
+  const result = await compact(
+    messages,
+    jevAsker(fetchFn, config.apiKey, config.model, config.accountId),
+    config,
+  );
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -224,20 +236,20 @@ export function decisionLogLines(
   );
 }
 
-async function getApiKey(
+/** A variable from the process environment, then from settings `env`. */
+async function getEnv(
   $: {
     env: { get: (name: string) => Promise<string | undefined> };
     settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
   },
-  config: HookConfig,
+  name: string,
 ): Promise<string | undefined> {
-  if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
+  const fromEnv = await $.env.get(name);
   if (fromEnv) return fromEnv;
   const settings = await $.settings.read();
   const env = settings['env'];
   if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
+    const value = (env as Record<string, unknown>)[name];
     if (typeof value === 'string' && value) return value;
   }
   return undefined;
@@ -262,7 +274,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
+      const config = {
+        ...configured,
+        apiKey: configured.apiKey ?? (await getEnv($, 'CLEF_API_TOKEN')),
+        accountId: configured.accountId ?? (await getEnv($, 'CLOUDFLARE_ACCOUNT_ID')),
+      };
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
